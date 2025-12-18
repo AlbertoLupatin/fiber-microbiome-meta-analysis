@@ -1,0 +1,25 @@
+Group,Int1,TP,Phase,GroupPhase
+A,RS2,TP1,Baseline,Baseline
+A,RS2,TP2,Baseline,Pre RS2
+A,RS2,TP3,RS2,Mid RS2
+A,RS2,TP4,RS2,End RS2
+A,RS2,TP5,Wash,Pre Ctl
+A,RS2,TP6,Ctl,Mid Ctl
+A,RS2,TP7,Ctl,End Ctl
+A,RS2,TP8,Wash,Pre RS4
+A,RS2,TP9,RS4,Mid RS4
+A,RS2,TP10,RS4,End RS4
+A,RS2,TP11,Wash,Wash3
+A,RS2,TP12,Wash,Wash4
+B,RS4,TP1,Baseline,Baseline
+B,RS4,TP2,Baseline,Pre RS4
+B,RS4,TP3,RS4,Mid RS4
+B,RS4,TP4,RS4,End RS4
+B,RS4,TP5,Wash,Pre Ctl
+B,RS4,TP6,Ctl,Mid Ctl
+B,RS4,TP7,Ctl,End Ctl
+B,RS4,TP8,Wash,Pre RS2
+B,RS4,TP9,RS2,Mid RS2
+B,RS4,TP10,RS2,End RS2
+B,RS4,TP11,Wash,Wash3
+B,RS4,TP12,Wash,Wash4

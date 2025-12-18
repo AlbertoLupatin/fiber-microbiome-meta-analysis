@@ -1,0 +1,13 @@
+.DS_Store
+
+Paper*/
+*.key
+
+scripts/.Old_Plots.R
+scripts/.Rhistory
+
+scripts/Interventions/R/.Rhistory
+scripts/Interventions/.Rbuildignore
+scripts/Interventions/.Rhistory
+
+scripts/preprocessing/.Rhistory

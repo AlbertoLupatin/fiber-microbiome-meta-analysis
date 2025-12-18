@@ -1,0 +1,330 @@
+---
+title: "Functional Profiling"
+output: html_document
+date: "2025-07-30"
+---
+
+## Libraries
+
+```{r, message=FALSE}
+library(tidyverse)
+library(phyloseq)
+library(Interventions)
+library(omixerRpm)
+
+library(ggplot2)
+library(ggembl)
+library(ggpubr)
+```
+
+## Load Data
+
+```{r, message=FALSE}
+fiber_data <- read.csv("../data/query/Query_Final.csv") %>% 
+  filter(Notes == "Shotgun") %>%
+  mutate(First.Author = gsub("-", "", First.Author)) 
+
+shotgun_studies <- fiber_data$First.Author
+fiber_types <- unique(unlist(str_split(fiber_data$Fiber.Type, fixed(" + ")), use.names = F))
+
+Metadata_list <- readRDS("../data/preprocessing/Metadata.RDS")[shotgun_studies]
+
+KO_annotations <- read_delim("../data/functional profiling/KO_List.txt")
+prokaryotic_KOs <- read_table("../Data/functional profiling/Prokaryotic_KO.hal", col_names = FALSE) %>% mutate(X1 = gsub("\\.hmm", "", X1))
+
+db <- loadDB("GMMs.v1.07")
+hierarchies <- read_delim("../Data/functional profiling/GMM.hierarchy.v1.07.tsv")
+```
+
+
+```{r}
+compute_HL <- function(Metadata_list, KOs_to_filter = NULL, compute_KOs_only = FALSE) {
+  
+  HL1_sums <- data.frame()
+  if (compute_KOs_only) {KOs_prokaryotic_complete <- data.frame()}
+
+  for (study_name in names(Metadata_list)) {
+    
+    study_path <- gsub("^(([^_]+)_([^_]+))_.*", "\\1", study_name)
+    file_path <- paste0("../Data/Query/", study_path, "/", study_path, "_Functional.txt")
+    if (!file.exists(file_path)) next
+    
+    cat("\n\n", study_name, "\n")
+    
+    meta <- as.data.frame(Metadata_list[[study_name]])
+    rownames(meta) <- meta$Run # For some reason I have to assign rownames again
+    meta$Timepoint <- factor(meta$Timepoint, levels = c("Before", "After"))
+  
+     
+    KOs <- read_delim(file_path) %>% 
+      pivot_longer(!feature, names_to = "Run", values_to = "Count") %>% 
+      mutate(Run = str_c(study_name, Run, sep = "_"),
+             Count = replace_na(Count, 0)) %>% 
+      filter(Run %in% meta$Run & !grepl("total_reads|category", feature)) %>% 
+      group_by(Run) %>% 
+      mutate(Normalized_Count = Count / Count[feature == "filtered_reads"],
+             feature = gsub("ko:", "", feature)) %>% 
+      filter(feature != "filtered_reads") %>% 
+      select(-Count)
+    
+    KOs_prokaryotic <- KOs[KOs$feature %in% prokaryotic_KOs$X1,] 
+    # paste0(round(((nrow(KOs) - nrow(KOs_prokaryotic)) / nrow(KOs) * 100), digits = 1), "% KOs thrown out") May delete contributions of eukaryotic gut commensals, but these have very low sums
+    
+    KOs_prokaryotic_wide <- KOs_prokaryotic %>% pivot_wider(names_from = Run, values_from = Normalized_Count) 
+    
+    if (compute_KOs_only) {
+      if (nrow(KOs_prokaryotic_complete) == 0) {
+        KOs_prokaryotic_complete <- KOs_prokaryotic_wide
+        next
+      } else {
+        KOs_prokaryotic_complete <- merge(KOs_prokaryotic_complete, KOs_prokaryotic_wide, by = "feature", all = T)
+        next
+      }
+    }
+    
+    
+    if (!is.null(KOs_to_filter)) {KOs_prokaryotic_wide <- KOs_prokaryotic_wide %>% filter(feature %in% KOs_to_filter)}
+    
+    GMMs <- rpm(KOs_prokaryotic_wide, module.db = db) # Generate metabolic module profiles
+    GMMs_df <- asDataFrame(GMMs, "abundance") # Convert results to dataframe
+    
+    GMM_hierarchies <- GMMs_df %>% 
+      select(-Module) %>% 
+      pivot_longer(!Description, names_to = "Run", values_to = "Abundance") %>% 
+      left_join(hierarchies %>% select(-Module, -Position), by = c("Description" = "Name")) 
+      
+      
+    HL1_sums_tmp <- GMM_hierarchies %>% 
+      group_by(Run, HL1) %>% 
+      summarise(HL1_sums = sum(Abundance)) %>% # Sum all the KOs' activities to have 1 value per module
+      ungroup() %>% 
+      group_by(Run) %>% 
+      mutate(HL1_sums = HL1_sums / sum(HL1_sums)) %>%  # Scale the values -> each sample has a sum of 1
+      ungroup() %>% 
+      mutate(Study = study_name) %>% 
+      left_join(meta)
+      
+    
+    HL1_sums <- rbind(HL1_sums, HL1_sums_tmp)
+  }
+  
+  if (!compute_KOs_only) {return(HL1_sums)}
+  if (compute_KOs_only) {return(KOs_prokaryotic_complete)}
+}
+
+
+
+plot_HLs <- function(HL1_sums, modules_to_select = NULL) {
+
+  for (fib in fiber_types) {
+  
+    HL1_tmp <- HL1_sums %>% filter(grepl(fib, Intervention))
+    
+    HL1_significance_tmp <- compare_means(HL1_sums ~ Timepoint, group.by = "HL1", data = HL1_tmp) %>% 
+      left_join(HL1_tmp %>% group_by(HL1) %>% summarize(max(HL1_sums)), by = "HL1") %>% 
+      mutate(y_coord = `max(HL1_sums)` * 0.98,
+             p.format = ifelse(p.format <= 0.05, paste0(p.format, "*"), p.format))
+    
+    if (!is.null(modules_to_select)) {
+      HL1_tmp <- HL1_tmp %>% filter(HL1 %in% modules_to_select)
+      HL1_significance_tmp <- HL1_significance_tmp %>% filter(HL1 %in% modules_to_select)
+    }
+    
+    functional_boxplots[[fib]] <- ggplot(HL1_tmp, aes(x = Timepoint, y = HL1_sums)) +
+      geom_boxplot(aes(fill = Timepoint)) +
+      scale_fill_manual(values = c("blue", "red")) +
+      geom_line(aes(x = Timepoint, y = HL1_sums, group = Individual), color = "grey", linetype = "dotted") +
+      facet_wrap(~ HL1, scales = "free_y", axes = "all_x") +
+      ggtitle(fib, subtitle = paste0("Studies: ", length(unique(HL1_tmp$Study)), 
+                                     "; Individuals: ", length(unique(HL1_tmp$Individual)))) +
+      theme_publication() +
+      theme(strip.text = element_text(size = 6),
+            title = element_text(size = 14),
+            axis.title = element_blank(),
+            legend.position = "none") +
+      stat_pvalue_manual(HL1_significance_tmp, label = "p = {p.format}", y.position = "y_coord", size = 2, bracket.size = 0)
+  }
+  
+  return(functional_boxplots)
+}
+
+plot_KOs <- function(KOs_abundances, module_name, interventions) {
+  
+  boxplots <- list()
+  
+  for (i in interventions) {
+    boxplots[[i]] <- ggplot(KOs_abundances %>% 
+                              filter(Intervention == i), 
+                            aes(x = Timepoint, y = log10(Abundance))) +  
+      geom_boxplot(aes(fill = Timepoint)) +
+      scale_fill_manual(values = c("Before" = "blue", "After" = "red")) +
+      geom_line(aes(group = Individual), linetype = "dotted", color = "grey") +
+      stat_compare_means(ref.group = "Before", label = "..p.format..", size = 2, bracket.size = 0) +
+      facet_wrap(~ Pathway, scale = "free_y", axes = "all_x") +
+      ggtitle(i) +
+      theme_publication() +
+      theme(legend.position = "none")
+  }
+  
+  savePlots(boxplots, paste0("../figures/functional/", module_name, " KOs.pdf"))
+}
+
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+HL1_sums <- compute_HL(Metadata_list)
+interventions <- unique(HL1_sums$Intervention)
+
+HL1_significance <- compare_means(HL1_sums ~ Timepoint, group.by = "HL1", data = HL1_sums) %>% 
+  left_join(HL1_sums %>% group_by(HL1) %>% summarize(max(HL1_sums))) %>% 
+  mutate(y_coord = `max(HL1_sums)` * 0.95,
+         p.format = ifelse(p.format <= 0.05, paste0(p.format, "*"), p.format))
+  
+
+ggplot(HL1_sums, aes(x = Timepoint, y = HL1_sums)) +
+  geom_boxplot(aes(fill = Timepoint), outlier.size = 0.75) +
+  scale_fill_manual(values = c("Before" = "blue", "After" = "red")) +
+  # geom_line(aes(x = Timepoint, y = HL1_sums, group = Individual), color = "grey", linetype = "dotted") +
+  facet_wrap(~ HL1, scales = "free_y", axes = "all_x") +
+  ggtitle("All Data Merged", subtitle = paste0("Studies: ", length(unique(HL1_sums$Study)), 
+                                   "; Individuals: ", length(unique(HL1_sums$Individual)))) +
+  theme_publication() +
+  theme(strip.text = element_text(size = 6),
+        title = element_text(size = 14),
+        axis.title = element_blank(),
+        legend.position = "none") +
+  stat_pvalue_manual(HL1_significance, label = "p = {p.format}",  y.position = "y_coord", size = 2, bracket.size = 0)
+
+ggsave("../figures/functional/Functional Boxplot AllData.pdf")
+```
+
+
+```{r}
+functional_boxplots <- list()
+functional_boxplots <- plot_HLs(HL1_sums)
+savePlots(functional_boxplots, "../figures/functional/Functional Boxplots FiberType.pdf")
+```
+
+```{r}
+relevant_modules <- c("alcohol metabolism", "carbohydrate degradation", "gas metabolism", "glycoprotein degradation")
+
+relevant_functional_boxplots <- list()
+relevant_functional_boxplots <- plot_HLs(HL1_sums, relevant_modules)
+savePlots(relevant_functional_boxplots, "../figures/functional/Functional Boxplot Relevant Modules.pdf")
+```
+
+# Selecting KOs
+
+## Preparing Modules with relative KOs dataframe
+
+```{r}
+modules_ko_file <- readLines("../data/functional profiling/Modules_and_KOs.txt")
+
+modules_ko_list <- list()
+module_id <- NULL
+module_name <- NULL
+ko_list <- c()
+
+for (line in modules_ko_file) {
+  line <- trimws(line)
+  
+  if (line == "///") {
+    
+    modules_ko_list[[length(modules_ko_list) + 1]] <- list(
+      Module_Id = module_id,
+      Pathway_Name = module_name,
+      KOs = paste(ko_list, collapse = ", ")
+    )
+    
+    module_id <- NULL
+    module_name <- NULL
+    ko_list <- c()
+  } else if (grepl("^MF\\d+", line)) {
+    
+    parts <- strsplit(line, "\t")[[1]]
+    module_id <- parts[1]
+    module_name <- parts[2]
+  } else {
+    
+    ko_line <- unlist(strsplit(line, "[,\t ]+"))
+    ko_list <- c(ko_list, ko_line)
+  }
+}
+
+modules_ko <- bind_rows(modules_ko_list) %>% 
+  merge(hierarchies %>% select(Module, HL1), by.x = "Module_Id", by.y = "Module")
+
+rm(modules_ko_file, modules_ko_list, module_id, module_name, ko_list, ko_line)
+```
+
+### Individual Modules
+
+#### Gas metabolism
+
+```{r}
+KOs_complete <- compute_HL(Metadata_list, compute_KOs_only = T)
+
+gas_modules_ko <- modules_ko %>% filter(HL1 == "gas metabolism") 
+gas_KOs <- unlist(str_split(gas_modules_ko$KOs, ", "))
+
+KOs_gas_abundances <- KOs_complete %>% filter(feature %in% gas_KOs) %>% 
+  pivot_longer(!feature, names_to = "Run", values_to = "Abundance") %>% 
+  merge(purrr::reduce(.x = Metadata_list, merge, all = T)) %>% 
+  mutate(Pathway = gas_modules_ko$Pathway_Name[grep(feature, gas_modules_ko$KOs)])
+
+KOs_gas_abundances$Pathway <- sapply(KOs_gas_abundances$feature, function(feat) gas_modules_ko$Pathway_Name[grep(feat, gas_modules_ko$KOs)])
+KOs_gas_abundances$Timepoint <- factor(KOs_gas_abundances$Timepoint, levels = c("Before", "After"))
+
+plot_KOs(KOs_gas_abundances, "Gas", interventions)
+```
+
+#### Alcohol Metabolism
+
+```{r}
+alcohol_modules_ko <- modules_ko %>% filter(HL1 == "alcohol metabolism") 
+alcohol_KOs <- unlist(str_split(alcohol_modules_ko$KOs, ", "))
+
+KOs_alcohol_abundances <- KOs_complete %>% filter(feature %in% alcohol_KOs) %>% 
+  pivot_longer(!feature, names_to = "Run", values_to = "Abundance") %>% 
+  merge(purrr::reduce(.x = Metadata_list, merge, all = T))
+
+KOs_alcohol_abundances$Pathway <- sapply(KOs_alcohol_abundances$feature, function(feat) alcohol_modules_ko$Pathway_Name[grep(feat, alcohol_modules_ko$KOs)][1])
+KOs_alcohol_abundances$Timepoint <- factor(KOs_alcohol_abundances$Timepoint, levels = c("Before", "After"))
+
+plot_KOs(KOs_alcohol_abundances, "Alcohol", interventions)
+```
+
+#### Carbohydrate Degradation
+
+```{r}
+fiber_degradation_to_select <- c("arabinoxylan", "fructan", "pectin", "starch")
+cho_modules_ko <- modules_ko %>% filter(Pathway_Name %in% grep(paste(fiber_degradation_to_select, collapse = "|"), Pathway_Name, value = T)) 
+cho_KOs <- unlist(str_split(cho_modules_ko$KOs, ", "))
+
+KOs_cho_abundances <- KOs_complete %>% filter(feature %in% cho_KOs) %>% 
+  pivot_longer(!feature, names_to = "Run", values_to = "Abundance") %>% 
+  merge(purrr::reduce(.x = Metadata_list, merge, all = T))
+
+KOs_cho_abundances$Pathway <- sapply(KOs_cho_abundances$feature, function(feat) cho_modules_ko$Pathway_Name[grep(feat, cho_modules_ko$KOs)][1])
+KOs_cho_abundances$Timepoint <- factor(KOs_cho_abundances$Timepoint, levels = c("Before", "After"))
+
+plot_KOs(KOs_cho_abundances, "Carbohydrate", interventions)
+```
+
+#### Organic Acid
+
+```{r}
+organicAcid_modules_ko <- modules_ko %>% filter(HL1 == "organic acid metabolism") 
+organicAcid_KOs <- unlist(str_split(organicAcid_modules_ko$KOs, ", "))
+
+KOs_organicAcid_abundances <- KOs_complete %>% filter(feature %in% organicAcid_KOs) %>% 
+  pivot_longer(!feature, names_to = "Run", values_to = "Abundance") %>% 
+  merge(purrr::reduce(.x = Metadata_list, merge, all = T))
+
+KOs_organicAcid_abundances$Pathway <- sapply(KOs_organicAcid_abundances$feature, function(feat) organicAcid_modules_ko$Pathway_Name[grep(feat, organicAcid_modules_ko$KOs)][1])
+KOs_organicAcid_abundances$Timepoint <- factor(KOs_organicAcid_abundances$Timepoint, levels = c("Before", "After"))
+
+plot_KOs(KOs_organicAcid_abundances, "Organic Acid", interventions)
+```
+

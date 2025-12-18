@@ -1,0 +1,513 @@
+---
+title: "Abundances Plots"
+output: html_document
+date: "2025-06-10"
+---
+
+## Libraries
+
+```{r library_loading, message=FALSE, warning=FALSE}
+library(Interventions)
+library(tidyverse)
+library(phyloseq)
+library(microViz)
+library(roperators)
+
+library(ggplot2)
+library(ggpubr)
+library(ggembl)
+library(ggheatmap)
+library(ggtext)
+library(ggplotify)
+library(ggrepel)
+library(patchwork)
+library(htmlwidgets)
+library(plotly)
+library(randomcoloR)
+library(Cairo)
+```
+
+## Load Data
+
+```{r data_loading, warning=FALSE}
+Metadata_list <- readRDS("../data/preprocessing/Metadata.RDS")
+Associations_16S_separated <- readRDS("../data/preprocessing/Associations_Genus_Separated.rds")
+Associations_16S_combined <- readRDS("../data/preprocessing/Associations_Genus_Combined.rds")
+Associations_shotgun_combined <- readRDS("../data/preprocessing/Associations_Species_Combined.rds")
+Associations_shotgun_separated <- readRDS("../data/preprocessing/Associations_Species_Separated.rds")
+
+fiber_data <- read.csv("../data/query/Query_Final.csv") %>% 
+  filter(Filter == "Y") %>% 
+  rename(Study = First.Author, 
+         FiberGrams = Total.Fibers..g.) %>% 
+  select(-X, -PMID, -Title, -Data.Availability, -Metadata.Availability, -Filter, -DOI) %>% 
+  mutate(Study = paste0(gsub("-", "", Study), " (n = ", N, ")"))
+```
+
+
+## Selecting genera to plot
+
+```{r selecting_genera}
+p_threshold <- 0.05
+fc_threshold <- 0.15
+
+
+Associations_16S_combined_filtered <- Associations_16S_combined %>% 
+  select(fc, p.adj) %>% 
+  rownames_to_column("Genus") %>% 
+  filter(p.adj <= p_threshold & abs(fc) >= fc_threshold & !(grepl("^.[A-Z]", Genus)))
+
+rownames(Associations_shotgun_combined) <- clearNames(rownames(Associations_shotgun_combined))
+Associations_shotgun_combined_filtered <- Associations_shotgun_combined %>% 
+  select(fc, p.adj) %>% 
+  rownames_to_column("Specie") %>% 
+  filter(p.adj <= p_threshold & abs(fc) >= fc_threshold)
+
+
+genera_order <- Associations_16S_combined_filtered %>% 
+  arrange(-fc) %>% 
+  mutate(Genus = factor(Genus, levels = Genus)) %>% 
+  pull(Genus)
+saveRDS(genera_order, "Relevant_Genera.rds")
+
+species_order <- Associations_shotgun_combined_filtered %>% 
+  arrange(-fc) %>% 
+  mutate(Specie = factor(Specie, levels = Specie)) %>% 
+  pull(Specie)
+saveRDS(Associations_shotgun_combined_filtered, "Relevant_Species.rds")
+```
+
+
+## Filter + Merge 
+
+```{r associations_merging}
+Associations_16S_separated_filtered <- list()
+Associations_shotgun_separated_filtered <- list()
+
+
+for (study_name in names(Associations_16S_separated)) {
+  
+  Associations_16S_separated_filtered[[study_name]] <- Associations_16S_separated[[study_name]] %>% 
+    rownames_to_column("Bacteria") %>% 
+    filter(Bacteria %in% genera_order) %>% 
+    select(Bacteria, fc, p.adj) %>% 
+    mutate(Study = paste0(study_name, " (n = ", fiber_data$N[grep(study_name, fiber_data$Study)], ")"),
+           SeqMethod = "16S")
+}
+
+for (study_name in names(Associations_shotgun_separated)) {
+  
+  Associations_shotgun_separated_filtered[[study_name]] <- Associations_shotgun_separated[[study_name]] %>% 
+    rownames_to_column("Bacteria") %>% 
+    mutate(Bacteria = clearNames(Bacteria)) %>% 
+    filter(Bacteria %in% species_order) %>%
+    select(Bacteria, fc, p.adj) %>% 
+    mutate(Study = paste0(study_name, " (n = ", fiber_data$N[grep(study_name, fiber_data$Study)], ")"),
+           SeqMethod = "Shotgun")
+}
+
+
+Associations_merged <- do.call(rbind, Associations_16S_separated_filtered) %>%
+  bind_rows(do.call(rbind, Associations_shotgun_separated_filtered)) %>% 
+  mutate(Significance = ifelse(p.adj <= 0.05, "*", "")) %>%   
+  group_by(Bacteria) %>% 
+  left_join(fiber_data %>% select(Study, Fiber.Type), by = "Study")
+```
+
+
+# Metadata Plots
+
+## Fiber Type bar plot
+
+```{r fiber_plot}
+study_order <- fiber_data %>% 
+  arrange(Fiber.Type, -FiberGrams) %>% 
+  mutate(Study = factor(Study, levels = Study)) %>% 
+  pull(Study)
+
+fiber_data <- fiber_data %>% mutate(Study = factor(Study, levels = study_order))
+fiber_types <- unique(unlist(str_split(fiber_data$Fiber.Type, fixed(" + ")), use.names = F))
+
+fiber_colors <- c(
+  "#1b9e77", # teal-green
+  "#d95f02", # orange
+  "#7570b3", # purple
+  "#e7298a", # pink
+  "#66a61e", # green
+  "#e6ab02", # mustard yellow
+  "#a6761d", # brown
+  "#666666", # grey
+  "#1f78b4"  # blue
+)
+names(fiber_colors) <- unique(fiber_data$Fiber.Type)
+
+fiber_type_16S_plot <- ggplot(fiber_data %>% filter(Notes == "16s"), aes(x = Study, y = FiberGrams, fill = Fiber.Type)) + 
+  geom_col(color = "black") +
+  scale_fill_manual(values = fiber_colors) +
+  scale_y_reverse() +
+  theme_publication() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        axis.title.y = element_blank(), axis.title.x = element_blank(),
+        legend.position = "left",
+        legend.title = element_blank())
+
+fiber_type_shotgun_plot <- ggplot(fiber_data %>% filter(Notes == "Shotgun"),
+                                  aes(x = Study, y = FiberGrams, fill = Fiber.Type)) + 
+  geom_col(color = "black") +
+  geom_richtext(x = "RehnerJ_2023 (n = 41)", y = -2.75, label = "NA", angle = 270, size = 2, fontface = "bold", show.legend = F) +
+  scale_fill_manual(values = fiber_colors) +
+  scale_y_reverse() +
+  theme_publication() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        axis.title.y = element_blank(), axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        legend.position = "left",
+        legend.title = element_blank())
+```
+
+
+## P-value bar plot
+
+```{r p_val_plot}
+p_val_16S_bar_plot <- ggplot(Associations_16S_combined_filtered %>% mutate(Genus = factor(Genus, levels = rev(genera_order))), 
+                                aes(x = -log10(p.adj), y = Genus)) +
+  geom_col(aes(fill = -log10(p.adj) >= -log10(0.05)), width = 0.8, color = "black") +
+  scale_fill_manual(values = c("darkgreen", "black")) +
+  geom_vline(xintercept = -log10(0.05), linetype = 3, color = "black", linewidth = 0.5) +
+  xlab("log10(p-value)") +
+  theme_publication() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "none")
+
+p_val_shotgun_bar_plot <- ggplot(Associations_shotgun_combined_filtered %>% mutate(Genus = factor(Specie, levels = rev(species_order))), 
+                                aes(x = -log10(p.adj), y = Genus)) +
+  geom_col(aes(fill = -log10(p.adj) >= -log10(0.05)), width = 0.8, color = "black") +
+  scale_fill_manual(values = c("darkgreen", "black")) +
+  geom_vline(xintercept = -log10(0.05), linetype = 3, color = "black", linewidth = 0.5) +
+  xlab("log10(p-value)") +
+  theme_publication() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "none")
+```
+
+
+## Disease
+
+```{r disease_plot}
+disease_type_16S_plot <- ggplot(fiber_data %>% filter(Notes == "16s"), 
+                                aes(x = Study, y = 1, fill = Disease)) +
+  geom_tile(color = "black") +
+  scale_fill_manual(values = c("NO" = "white", "Dysbiosis" = "orange", "NAFLD" = "brown", "Overweight" = "blue")) +
+  theme_publication() +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "left",
+        legend.title = element_blank())
+
+disease_type_shotgun_plot <- ggplot(fiber_data %>% filter(Notes == "Shotgun"),
+                                    aes(x = Study, y = 1, fill = Disease)) +
+  geom_tile(color = "black") +
+  scale_fill_manual(values = c("NO" = "white", "Dysbiosis" = "orange", "NAFLD" = "brown", "Overweight" = "blue")) +
+  theme_publication() +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "left",
+        legend.text = element_text(size = 5), legend.title = element_blank(), legend.key.size = unit(0.4, "cm"))
+```
+
+
+# All Associations Plots
+
+## 16S vs Shotgun
+
+```{r}
+Associations_shotgun_byGenera <- Associations_shotgun_combined %>% 
+  mutate(Genus = gsub("\\s.*", "", rownames(.))) %>% 
+  group_by(Genus) %>% 
+  summarize(Shotgun = sum(fc)) %>% 
+  select(Genus, Shotgun)
+
+Associations_seq <- merge(Associations_shotgun_byGenera, Associations_16S_combined %>% select(fc) %>% rename(STs = fc), by.x = 1, by.y = 0) %>% 
+  mutate(Variation = case_when(Shotgun > 0 & STs > 0 ~ "Enriched",
+                               Shotgun < 0 & STs < 0 ~ "Depleted",
+                               .default = "Different"),
+         Label = ifelse(Variation == "Different", Genus, ""))
+
+
+ggplot(Associations_seq, aes(x = STs, y = Shotgun)) +
+  geom_point(aes(fill = Variation), color = "black", size = 3, shape = 21) +
+  geom_text_repel(aes(label = Genus), size = 5, max.overlaps = 7) +
+  geom_smooth(method = "lm") +
+  geom_hline(yintercept = 0, linetype = 3) + geom_vline(xintercept = 0, linetype = 3) +
+  geom_abline(linetype = 3) +
+  scale_fill_manual(values = c("Enriched" = "red", "Depleted" = "blue", "Different" = "white")) +
+  stat_cor(method = "pearson", size = 6) +
+  ylim(c(-1, 1)) + 
+  xlab("16S Effect Size [gFC]") +
+  ylab("Shotgun Effect Size [gFC]") +
+  theme_publication() +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 12),
+        aspect.ratio = 1)
+
+ggsave("../figures/abundances/16S vs Shotgun.pdf", width = 7, height = 7)
+```
+
+
+## Genera Dot Plot - 16S data
+
+```{r genera_dot}
+genera_plot <- ggplot(data = Associations_merged %>% 
+                        filter(SeqMethod == "16S") %>% 
+                        ungroup() %>% 
+                        complete(Study, Bacteria, fill = list(p.adj = 1, fc = NA)) %>% 
+                        mutate(Aesthetics = case_when(fc <= -fc_threshold ~ "negative",
+                                                      fc >= fc_threshold ~ "positive",
+                                                      is.na(fc) ~ "not detected",
+                                                      .default = "neutral"),
+                               Bacteria = factor(Bacteria, levels = rev(genera_order))), 
+                      aes(x = Study, y = Bacteria, size = abs(fc))) +
+  
+  geom_point(data = ~ filter(.x, Aesthetics %in% c("positive", "negative")), # Triangles
+               aes(size = abs(fc), color = Aesthetics, shape = Aesthetics, fill = fc)) +
+  geom_point(data = ~ filter(.x, Aesthetics == "neutral"),
+             aes(color = Aesthetics, shape = Aesthetics)) +
+  geom_point(data = ~ filter(.x, Aesthetics == "not detected"), # Crosses
+             aes(color = Aesthetics, shape = Aesthetics), size = 1.5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_color_manual(values = c("negative" = "blue", "positive" = "red", "neutral" = "black", "not detected" = "black")) +
+  scale_shape_manual(values = c("negative" = 25, "positive" = 24, "neutral" = 1, "not detected" = 4)) +
+  scale_size_continuous(range = c(0.5, 2)) +
+  theme_publication() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(angle = 270),
+        legend.position = "left")
+                                       
+
+pdf("../figures/abundances/Genera Abundances 16S Dot.pdf")
+(genera_plot + p_val_16S_bar_plot + plot_layout(widths = c(3, 1))) /
+     (disease_type_16S_plot + plot_spacer() + plot_layout(widths = c(3, 1))) /
+            (fiber_type_16S_plot + plot_spacer() + plot_layout(widths = c(3, 1))) +
+  plot_layout(heights = c(10, 1,  3))
+dev.off()
+```
+
+## Species Dot Plot - Shotgun data
+
+```{r}
+specie_plot <- ggplot(data = Associations_merged %>% 
+                        filter(SeqMethod == "Shotgun") %>% 
+                        ungroup() %>% 
+                        complete(Study, Bacteria, fill = list(p.adj = 1, fc = NA)) %>% 
+                        mutate(Aesthetics = case_when(fc <= -fc_threshold ~ "negative",
+                                                      fc >= fc_threshold ~ "positive",
+                                                      is.na(fc) ~ "not detected",
+                                                      .default = "neutral"),
+                               Bacteria = factor(Bacteria, levels = rev(species_order))), 
+                      aes(x = Study, y = Bacteria, size = abs(fc))) +
+  
+  geom_point(data = ~ filter(.x, Aesthetics %in% c("positive", "negative")), # Triangles
+               aes(size = abs(fc), color = Aesthetics, shape = Aesthetics, fill = fc)) +
+  geom_point(data = ~ filter(.x, Aesthetics == "neutral"),
+             aes(color = Aesthetics, shape = Aesthetics)) +
+  geom_point(data = ~ filter(.x, Aesthetics == "not detected"), # Crosses
+             aes(color = Aesthetics, shape = Aesthetics), size = 1.5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_color_manual(values = c("negative" = "blue", "positive" = "red", "neutral" = "black", "not detected" = "black")) +
+  scale_shape_manual(values = c("negative" = 25, "positive" = 24, "neutral" = 1, "not detected" = 4)) +
+  scale_size_continuous(range = c(0.5, 2)) +
+  theme_publication() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(angle = 270, hjust = 0),
+        legend.position = "left")
+                                       
+
+pdf("../figures/abundances/Species Abundances Dot.pdf")
+(specie_plot + p_val_shotgun_bar_plot + plot_layout(widths = c(3, 1))) /
+     (disease_type_shotgun_plot + plot_spacer() + plot_layout(widths = c(3, 1))) /
+            (fiber_type_shotgun_plot + plot_spacer() + plot_layout(widths = c(3, 1))) +
+  plot_layout(heights = c(10, 1,  3))
+dev.off()
+```
+
+
+# Fiber Type
+
+## Compute Associations
+
+```{r, warning=FALSE}
+Phyloseq_list_specie <- readRDS("../data/preprocessing/Phyloseq.rds")
+
+specie_associations_list <- list()
+n_studies_per_fibertype <- list()
+n_individuals_per_fibertype <- list()
+n_fiber_types_specie_processed <- 0
+
+for (fib in fiber_types) {
+  
+  cat(paste0(fib, ": "))
+  
+  fiber_data_tmp <- fiber_data %>% 
+    filter(grepl(fib, Fiber.Type) & Notes == "Shotgun") %>% 
+    mutate(Study = gsub("\\s.*", "", Study))
+  
+  if (nrow(fiber_data_tmp) < 1) {
+    cat("Insufficient Data\n\n")
+    next
+  } else {
+    n_fiber_types_specie_processed %+=% 1
+  }
+  
+  studies_to_select <- which(names(Metadata_list) %in% fiber_data_tmp$Study)
+  n_studies_per_fibertype[[fib]] <- length(studies_to_select)
+  n_individuals_per_fibertype[[fib]] <- sum(fiber_data_tmp$N)
+  cat("selecting", length(studies_to_select), "studies - N = ", n_individuals_per_fibertype[[fib]], "\n\n")
+  
+  metadata_tmp <- as.data.frame(bind_rows(Metadata_list[studies_to_select]))
+  rownames(metadata_tmp) <- metadata_tmp$Run
+  phyloseq_tmp <- do.call(merge_phyloseq, Phyloseq_list_specie[studies_to_select])
+  
+  specie_associations_list[[fib]] <- associations(runSIAMCAT(phyloseq_tmp, metadata_tmp)) %>% 
+    select(fc, p.adj) %>% 
+    rownames_to_column("Specie") %>% 
+    mutate(Specie = clearNames(Specie),
+           FiberType = fib)
+}
+```
+
+## Heatmap
+
+```{r}
+n_studies_per_fibertype_df <- t(data.frame(n_studies_per_fibertype)) %>% 
+  as.data.frame(.) %>% 
+  rownames_to_column("FiberType") %>% 
+  mutate(FiberType = case_when(grepl("General", FiberType) ~ "General Fibers",
+                               grepl("glucan", FiberType) ~ "β-glucan",
+                               .default = FiberType))
+  
+n_individuals_per_fibertype <- unlist(n_individuals_per_fibertype)
+
+
+specie_associations_fibertypes_merged <- bind_rows(specie_associations_list)
+
+relevant_species <- specie_associations_fibertypes_merged %>% 
+  filter(p.adj <= 0.05) %>% 
+  arrange(fc) %>% 
+  pull(Specie)
+
+specie_associations_fibertypes_merged <- specie_associations_fibertypes_merged %>% 
+  filter(Specie %in% relevant_species) %>% 
+  mutate(Significance = ifelse(p.adj <= 0.05, "*", ""),
+         StudiesPerFiber = n_individuals_per_fibertype[match(FiberType, names(n_individuals_per_fibertype))],
+         FiberTypeLabel = paste0(FiberType, " (n = ", StudiesPerFiber, ")"),
+         Specie = factor(Specie, levels = unique(relevant_species))) %>% 
+  complete(FiberTypeLabel, Specie, fill = list(fc = 0, Significance = ""))
+
+
+fibers_label <- unique(specie_associations_fibertypes_merged$FiberTypeLabel)
+fibers_label <- fibers_label[-length(fibers_label)]
+# fibers_label[length(fibers_label)] <- gsub("β", "\u03B2", fibers_label[length(fibers_label)])
+
+specie_heatmap <- ggplot(specie_associations_fibertypes_merged %>% filter(!grepl("glucan", FiberTypeLabel)), 
+                         aes(x = FiberTypeLabel, y = Specie, fill = fc)) +
+  geom_tile(color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  geom_text(aes(label = Significance), nudge_y = -0.25, size = 3.5) +
+  scale_x_discrete(labels = gsub("\\(n", "\n\\(n", fibers_label)) +
+  theme_publication() +
+  theme(legend.position = "none",
+        axis.title = element_blank(),
+        text = element_text(size = 9)) 
+
+n_studies_fibertype_plot <- ggplot(n_studies_per_fibertype_df %>% filter(!grepl("glucan", FiberType)),
+                             aes(x = FiberType, y = V1, fill = FiberType)) +
+  geom_col() + 
+  scale_fill_manual(values = fiber_colors) +
+  scale_y_reverse(breaks = c(0, 3, 6, 9)) +
+  ylab("N° Studies\nPer Fibertype") +
+  theme_publication() +
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "none")
+
+cairo_pdf("../figures/abundances/Species Abundances FiberType.pdf")
+specie_heatmap / n_studies_fibertype_plot + plot_layout(heights = c(6, 1))
+dev.off()
+```
+
+
+# Eubiosis - Dysbiosis Classifier
+
+## 16S
+
+```{r scores_16S}
+ scores_16S <- read.csv("../data/Scores Table 16S.tsv", sep = "\t") %>% 
+  arrange(mean.weight) %>% 
+  rename("Coefficient" = "mean.weight")
+
+merge(Associations_16S_combined, scores_16S, by.x = 0, by.y = "genus") %>% 
+  # filter(p.adj <= 0.05) %>% 
+  rename("Genus" = 1) %>% 
+  mutate(DiseaseEnrichment = case_when(Coefficient > 0 & fc > 0 ~ "UP",
+                           Coefficient < -0 & fc < -0 ~ "DW",
+                           .default = "Neutral"),
+         Label = ifelse((Coefficient <= -0.05 & fc <= -0.25) | (Coefficient >= 0 & fc >= 0.05), Genus, "")) %>% 
+  ggplot(., aes(x = fc, y = Coefficient, color = DiseaseEnrichment)) +
+  geom_point() +
+  geom_text_repel(aes(label = Label),
+                  max.overlaps = 20,
+                  box.padding = 0.3,
+                  point.padding = 0.2) +
+  stat_cor(aes(x = fc, y = Coefficient), inherit.aes = F, size = 5) +
+  scale_color_manual(values = c("UP" = "red", "DW" = "blue", "none" = "grey70")) +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  ylim(c(-0.2, 0.2)) + xlim(c(-0.4, 0.4)) +
+  theme_publication() + 
+  theme(legend.position = "none",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 12))
+ggsave("../figures/eu-dysbiosis/H vs D 16S.pdf", width = 6, height = 6)
+```
+
+## Shotgun
+
+```{r scores_shotgun, eval=FALSE}
+scores_shotgun <- read.csv("../data/scores table shotgun.tsv", sep = "\t") %>% 
+  arrange(mean.weight) %>% 
+  rename("Coefficient" = "mean.weight") %>% 
+  mutate(Specie = clearNames(mOTUs)) %>% 
+  select(-mOTUs)
+
+
+merge(Associations_shotgun_combined, scores_shotgun, by.x = 0, by.y = "Specie") %>% 
+  # filter(p.adj <= 0.05) %>% 
+  rename("Specie" = 1) %>% 
+  mutate(DiseaseEnrichment = case_when(Coefficient > 0 & fc > 0 ~ "UP",
+                                       Coefficient < -0 & fc < -0 ~ "DW",
+                                       .default = "Neutral"),
+         Label = ifelse((Coefficient <= -0.05 & fc <= -0.25) | (Coefficient >= 0 & fc >= 0.05), Specie, "")) %>% 
+  ggplot(., aes(x = fc, y = Coefficient, color = DiseaseEnrichment)) +
+  geom_point() +
+  geom_text_repel(aes(label = Label),
+                  max.overlaps = 7,
+                  box.padding = 0.3,
+                  point.padding = 0.2) +
+  stat_cor(aes(x = fc, y = Coefficient), inherit.aes = F, size = 5) +
+  scale_color_manual(values = c("UP" = "red", "DW" = "blue", "none" = "grey70")) +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  xlab("gFC") +
+  # coord_equal(ratio = 1.5) +
+  theme_publication() + 
+  theme(legend.position = "none",
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 12))
+ggsave("../figures/eu-dysbiosis/H vs D Shotgun.pdf", width = 6, height = 6)
+```

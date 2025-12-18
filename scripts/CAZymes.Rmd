@@ -1,0 +1,508 @@
+---
+title: "PCA"
+output: html_document
+date: "2025-05-21"
+---
+
+## Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SIAMCAT)
+library(Interventions)
+library(openxlsx)
+library(fgsea)
+library(roperators)
+
+library(ggplot2)
+library(ggfortify)
+library(ggembl)
+library(ggtext)
+library(patchwork)
+library(plotly)
+```
+
+# Load Data + Preprocessing
+
+```{r}
+fiber_data <- read.csv("../data/query/Query_Final.csv") %>% 
+  filter(Notes == "Shotgun" & !grepl("Omary", First.Author)) %>% 
+  rename(Study = First.Author, 
+         FiberGrams = Total.Fibers..g.) %>% 
+  select(-X, -PMID, -Title, -Data.Availability, -Metadata.Availability, -Filter, -DOI) %>% 
+  mutate(Study = gsub("-", "", Study))
+
+fiber_types <- unique(unlist(str_split(fiber_data$Fiber.Type, fixed(" + ")), use.names = F))
+shotgun_studies <- fiber_data$Study
+
+study_order <- fiber_data %>% 
+  arrange(Fiber.Type, -FiberGrams) %>% 
+  mutate(Study = factor(Study, levels = Study)) %>% 
+  pull(Study)
+
+
+Metadata_list <- readRDS("../data/preprocessing/Metadata.RDS")[shotgun_studies]
+for(study_name in names(Metadata_list)) {
+  
+  Metadata_list[[study_name]] <- Metadata_list[[study_name]] %>%
+    mutate(Individual = paste0(study_name, as.character(Individual)),
+           Study = study_name) %>% 
+    as.data.frame(.)
+}
+
+Metadata_merged <- purrr::reduce(.x = Metadata_list,
+                                   merge, all = T) %>% 
+  filter(!grepl("DelannoyBrunoO_2021_Extruded09|DelannoyBrunoO_2021_Extruded14", Individual))
+rownames(Metadata_merged) <- Metadata_merged$Run
+
+rm(study_name)
+```
+
+Removing enzymes that are not present in at least 10 studies and the enzymes having abundance = 0 for (almost) every sample
+
+```{r}
+Feat_list <- readRDS("../data/preprocessing/CAZymes_List.RDS")
+Feat_list <- lapply(Feat_list, function(df) df <- df %>% rownames_to_column("CAZyme"))
+
+Feat_merged <- Feat_merged <- Reduce(function(dtf1, dtf2) merge(dtf1, dtf2, all = TRUE, by = "CAZyme"),
+                                     Feat_list) %>% 
+  column_to_rownames("CAZyme")
+
+Feat_merged[is.na(Feat_merged)] <- 0
+Feat_merged <- Feat_merged[, rownames(Metadata_merged)]
+```
+
+# Associations
+
+## Combined
+
+```{r}
+Feat_merged_mat <- as.matrix(Feat_merged)
+Feat_merged_mat[which(is.na(Feat_merged_mat))] <- 0
+class(Feat_merged_mat) <- "numeric"
+
+OTU <- otu_table(Feat_merged_mat, taxa_are_rows = T)
+
+Phyloseq <- phyloseq(OTU, sample_data(Metadata_merged))
+Phyloseq_rel <- microbiome::transform(Phyloseq, "compositional")
+
+fc_threshold <- 0.1
+
+associations_combined <- runSIAMCAT(Phyloseq_rel, Metadata_merged) %>% 
+  associations(.) %>% 
+  select(fc, p.adj) %>% 
+  rownames_to_column("CAZyme") %>% 
+  mutate(Group = case_when(fc > fc_threshold ~ "Fiber-Enriched",
+                           fc < -fc_threshold ~ "Fiber-Depleted",
+                           .default = "No Changes")) %>% 
+  arrange(-fc) %>% 
+  mutate(CAZyme = factor(CAZyme, levels = CAZyme))
+
+rm(Feat_merged_mat, OTU, Phyloseq, Phyloseq_rel)
+```
+
+## Annotations
+
+```{r}
+annotations <- read.xlsx("../data/CAZymes Annotations.xlsx") %>% 
+  select(c(Family:Subfamily,ORIGIN:FUNCTION_AT_DESTINATION_3, Glycan_annotation)) %>% 
+  separate_rows(ORIGIN,sep=",") %>% 
+  separate_rows(FUNCTION_IN_ORIGIN,sep=",") %>% 
+  separate_rows(FUNCTION_AT_DESTINATION_1,sep=",") %>% 
+  separate_rows(FUNCTION_AT_DESTINATION_2,sep=",") %>%
+  separate_rows(FUNCTION_AT_DESTINATION_3,sep=",")
+
+annotations_subfamily <- annotations %>% 
+  select(Subfamily, FUNCTION_AT_DESTINATION_1, FUNCTION_AT_DESTINATION_3) %>% 
+  dplyr::rename(Pathway = FUNCTION_AT_DESTINATION_1,
+                CAZyme = Subfamily,
+                Function = FUNCTION_AT_DESTINATION_3) %>% 
+  mutate(Function = gsub("_", " ", Function)) %>% 
+  drop_na() %>% 
+  filter(!Pathway == "Unknown") %>% 
+  group_by(Pathway) %>% 
+  distinct() %>% 
+  mutate(Pathway = as.factor(Pathway),
+         CAZyme = gsub("([A-Z])_","\\1", CAZyme))
+
+pathways <- list()
+
+for (group in unique(annotations_subfamily$Pathway)){
+
+  tmp_df <- annotations_subfamily %>% filter(Pathway == group)
+  cazymes <- tmp_df$CAZyme
+  pathways[group] <- group
+  pathways[[length(pathways)]] <- cazymes
+}
+
+
+functions <- list()
+
+for (group in unique(annotations_subfamily$Function)){
+
+  tmp_df <- annotations_subfamily %>% filter(Function == group)
+  cazymes <- tmp_df$CAZyme
+  functions[group] <- group
+  functions[[length(functions)]] <- cazymes
+}
+
+
+associations_combined_enriched <- merge(associations_combined, annotations_subfamily, by = "CAZyme")
+associations_combined_enriched_filt <- associations_combined_enriched %>% 
+  mutate(PathwayColor = ifelse(is.na(Pathway), "NO", "YES"),
+         FunctionColor = ifelse(is.na(Pathway), "NO", "YES")) %>% 
+  filter(Group != "No Changes")  %>% 
+  arrange(fc) %>% 
+  mutate(CAZyme = factor(CAZyme, levels = unique(CAZyme)))
+relevant_cazymes <- levels(associations_combined_enriched_filt$CAZyme)
+
+rm(annotations, group, tmp_df, cazymes)
+```
+
+## Separated
+
+```{r}
+associations_filt_list <- list()
+
+for (study in shotgun_studies) {
+  
+  cat(study, "\n")
+  
+  metadata_tmp <- Metadata_merged %>% filter(Study == study)
+  
+  tmp_feat_mat <- as.matrix(Feat_merged[, rownames(metadata_tmp)])
+  class(tmp_feat_mat) <- "numeric"
+  
+  OTU_tmp <- otu_table(tmp_feat_mat, taxa_are_rows = T)
+  
+  tmp_phylo <- phyloseq(OTU_tmp, sample_data(metadata_tmp))
+  tmp_rel_phylo <- microbiome::transform(tmp_phylo, "compositional")
+  
+  associations_filt_list[[study]] <- runSIAMCAT(tmp_rel_phylo, metadata_tmp, study_coveriate = F) %>% 
+    associations(.) %>% 
+    select(fc, p.adj) %>% 
+    mutate(Study = study) %>% 
+    rownames_to_column("CAZyme")
+}
+
+associations_separated <- bind_rows(associations_filt_list) %>% 
+  mutate(significance = ifelse(p.adj <= 0.05, "*",  ""),
+         Aesthetics = case_when(fc <= -0.1 ~ "negative",
+                           fc >= 0.1 ~ "positive",
+                           .default = "neutral"))
+
+rm(associations_filt_list, metadata_tmp, tmp_feat_mat, OTU_tmp, tmp_phylo, tmp_rel_phylo, study)
+```
+
+## Per Fiber Types
+
+```{r, echo=FALSE}
+n_studies_per_fibertype <- list()
+n_individuals_per_fibertype <- list()
+associations_fibertype_list <- list()
+n_fiber_types_processed <- 0
+
+for (fib in fiber_types) {
+  
+  cat(paste0(fib, ": "))
+  
+  fiber_data_tmp <- fiber_data %>% filter(grepl(fib, Fiber.Type))
+
+  if (nrow(fiber_data_tmp) <= 1) {
+    cat("Insufficient Data\n\n")
+    next
+  } else {
+    n_fiber_types_processed %+=% 1
+  }
+  
+  studies_to_select <- which(names(Metadata_list) %in% fiber_data_tmp$Study)
+  n_studies_per_fibertype[[fib]] <- length(studies_to_select)
+  n_individuals_per_fibertype[[fib]] <- sum(fiber_data_tmp$N)
+  cat("selecting", length(studies_to_select), "studies - N = ", n_individuals_per_fibertype[[fib]], "\n\n")
+  
+  metadata_tmp <- as.data.frame(bind_rows(Metadata_list[studies_to_select]))
+  rownames(metadata_tmp) <- metadata_tmp$Run
+  
+  feat_tmp <- Feat_merged %>% select(any_of(rownames(metadata_tmp)))
+  feat_tmp[is.na(feat_tmp)] <- 0
+  feat_tmp_mat <- as.matrix(feat_tmp)
+  class(feat_tmp_mat) <- "numeric"
+  
+  OTU_tmp <- otu_table(feat_tmp_mat, taxa_are_rows = T)
+  
+  tmp_phylo <- phyloseq(OTU_tmp, sample_data(metadata_tmp))
+  tmp_rel_phylo <- microbiome::transform(tmp_phylo, "compositional")
+  
+  associations_fibertype_list[[fib]] <- associations(runSIAMCAT(tmp_rel_phylo, metadata_tmp)) %>% 
+    select(fc, p.adj) %>% 
+    rownames_to_column("CAZyme") %>% 
+    mutate(FiberType = fib)
+}
+
+associations_fibertype <- bind_rows(associations_fibertype_list)
+
+rm(fib, fiber_data_tmp, studies_to_select, metadata_tmp, feat_tmp, feat_tmp_mat, OTU_tmp, tmp_phylo, tmp_rel_phylo, associations_fibertype_list)
+```
+
+
+# fGSEA Enrichment
+
+```{r}
+fc <- associations_combined_enriched %>% group_by(CAZyme) %>% slice(1) %>% pull(fc)
+names(fc) <- associations_combined_enriched %>% group_by(CAZyme) %>% slice(1) %>% pull(CAZyme)
+
+set.seed(1000)
+fgseaRes_pathway <- fgseaMultilevel(pathways, fc)[order(-NES), ] %>% filter(pathway != "Other")
+
+cazymes_per_pathway <- fgseaRes_pathway$leadingEdge
+names(cazymes_per_pathway) <- fgseaRes_pathway$pathway
+
+
+pdf("../figures/cazymes/Enrichment Scores Pathway.pdf")
+plotGseaTable(pathways[fgseaRes_pathway$pathway], fc, fgseaRes_pathway,
+              colwidths = c(5, 3, 0.8, 1, 0),
+              headerLabelStyle = list(fontface = "bold", size = 15),
+              pathwayLabelStyle = list(fontface = "bold", size = 13),
+              gseaParam = 0.5)
+dev.off()
+
+
+pdf("../figures/cazymes/DF Mucin Enrichments.pdf")
+(plotEnrichment(pathways[["DF"]], fc) + 
+    annotate("text", x = 250, y = 0.30, label = paste0("p.val = ", round(fgseaRes_pathway$pval[fgseaRes_pathway$pathway == "DF"], 3)), size = 5) + 
+    ggtitle("Dietary Fibers") + 
+    ylim(-0.45, 0.3) +
+    theme_publication() +
+    theme(title = element_text(size = 16),
+          axis.title = element_text(size = 12),
+          axis.text = element_text(size = 9))) +
+(plotEnrichment(pathways[["Mucin"]], fc) + 
+   annotate("text", x = 250, y = 0.30, label = paste0("p.val = ", round(fgseaRes_pathway$pval[fgseaRes_pathway$pathway == "Mucin"], 3)), size = 5) + 
+   ggtitle("Mucin") +
+   ylim(-0.45, 0.3) +
+   theme_publication() +
+   theme(axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(),
+         title = element_text(size = 16),
+         axis.title.x = element_text(size = 12),
+         axis.text = element_text(size = 9)))
+dev.off()
+
+
+fgseaRes_function <- fgseaMultilevel(functions, fc)[order(-NES), ] %>% filter(!grepl("Gum|Chtin|Glycoprotein|PG|Unknown", pathway))
+
+cazymes_per_pathway <- fgseaRes_function$leadingEdge
+names(cazymes_per_pathway) <- fgseaRes_function$pathway
+
+
+pdf("../Plots/CAZymes/Enrichment Scores Function.pdf")
+plotGseaTable(pathways[fgseaRes_function$pathway], fc, fgseaRes_function,
+              colwidths = c(5, 3, 0.8, 1, 0),
+              headerLabelStyle = list(fontface = "bold", size = 15),
+              pathwayLabelStyle = list(fontface = "bold", size = 13),
+              gseaParam = 0.5)
+dev.off()
+
+rm(fc, fgseaRes_pathway, fgseaRes_function)
+```
+
+# Plots
+
+## Combined
+
+### Pathways
+
+```{r}
+# Bar Plot
+associations_combined_plot <- ggplot(associations_combined_enriched_filt %>% 
+                                       group_by(CAZyme) %>% slice(1), 
+                                     aes(x = fc, y = CAZyme)) +
+  geom_col(aes(fill = Group)) +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme_publication() +
+  theme(legend.position = "none",
+        axis.title = element_blank()) +
+  ggtitle("CAZymes generalized Fold Change")
+
+
+# Pathway Plot
+pathway_combined_plot <- ggplot(associations_combined_enriched_filt %>% 
+                                  group_by(CAZyme) %>% slice(1),
+                                aes(x = 1, y = CAZyme, fill = Pathway)) +
+  geom_tile(color = "black", alpha = 1) +
+  scale_fill_manual(values = c("DF" = "black", "Mucin" = "grey")) +
+  xlab("DF / \nMucin") +
+  theme_publication() +
+  theme(axis.text.y = element_blank(), axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none") 
+
+
+# P-Value Plot
+significance_combined_plot <- ggplot(data = associations_combined_enriched_filt %>% 
+                                       group_by(CAZyme) %>% slice(1), 
+                                     aes(x = -log10(p.adj), y = CAZyme)) + 
+  geom_col(aes(fill = -log10(p.adj) < -log10(0.05))) +
+  scale_fill_manual(values = c("darkgreen", "black")) +
+  theme_publication() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position = "none") +
+  xlab("log10(p-value)") +
+  geom_vline(xintercept = -log10(0.05), color = "darkgreen", linetype = "dashed") 
+
+
+pdf("../figures/cazymes/Pathways Fold change.pdf")
+associations_combined_plot + pathway_combined_plot + significance_combined_plot + plot_layout(widths = c(4, 0.2, 1))
+dev.off()
+```
+
+### Functions
+
+```{r}
+associations_function_plot <- ggplot(associations_combined_enriched_filt %>% 
+                                       group_by(Function) %>% complete(CAZyme), 
+                                     aes(x = Function, y = CAZyme, fill = is.na(fc))) +
+  geom_tile(color = "black") +
+  scale_fill_manual(values = c("FALSE" = "black", "TRUE" = "white")) +
+  theme_publication() +
+  ggtitle("Functions") +
+  theme(legend.position = "none",
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.text.x = element_text(size = 5, angle = 315, hjust = 0, vjust = 1),
+        axis.title = element_blank())
+
+
+pdf("../Plots/CAZymes/Functions Fold change.pdf")
+associations_combined_plot + associations_function_plot + significance_combined_plot + plot_layout(widths = c(4, 2, 1))
+dev.off()
+```
+
+
+## Plot
+
+```{r CAZymes_plotting}
+relevant_cazymes_fibertype <- associations_fibertype %>% 
+  filter(p.adj <= 0.05 & abs(fc) >= 0.1) %>% 
+  arrange(fc) %>% 
+  distinct(CAZyme) %>% 
+  mutate(CAZyme = factor(CAZyme, levels = CAZyme)) %>% 
+  pull(CAZyme)
+
+
+associations_fibertype_function_filt <- associations_fibertype %>% 
+  merge(annotations_subfamily, all.x = T) %>% 
+  mutate(Pathway = ifelse(is.na(Pathway), "Unknown", as.character(Pathway)),
+         Function = ifelse(is.na(Function), "Unknown", Function)) %>% 
+  filter(CAZyme %in% relevant_cazymes_fibertype & !grepl("Gum|Chtin|Glycoprotein|PG|Unknown", Function)) %>% 
+  mutate(StudiesPerFiber = n_individuals_per_fibertype[match(FiberType, names(n_individuals_per_fibertype))],
+         FiberTypeLabel = paste0(FiberType, " (n = ", StudiesPerFiber, ")"),
+         fc = ifelse(abs(fc) < 0.1, 0, fc),
+         p.adj = ifelse(abs(fc) < 0.1, 1, p.adj),
+         Significance = ifelse(p.adj <= 0.05, "*", ""),
+         CAZyme = factor(CAZyme, levels = levels(relevant_cazymes_fibertype))) 
+FiberTypeLabel <- unique(associations_fibertype_function_filt$FiberTypeLabel)
+
+
+associations_fibertype_plot <-  ggplot(associations_fibertype_function_filt,
+                                       aes(x = FiberTypeLabel, y = CAZyme, fill = fc)) +
+  geom_tile(color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  geom_text(aes(label = Significance), size = 2, vjust = 0.75) +
+  theme_publication() +
+  scale_x_discrete(labels = gsub(" \\(", "\n\\(", FiberTypeLabel)) +
+  theme(legend.position = "none", axis.title = element_blank(),
+        axis.text.y = element_text(size = 4)) +
+  ggtitle("Significant CAZymes")
+
+n_studies_per_fibertype_df <- t(data.frame(n_studies_per_fibertype)) %>% as.data.frame(.) %>% rownames_to_column("FiberType")
+n_individuals_per_fibertype <- unlist(n_individuals_per_fibertype)
+n_studies_bar_plot <- ggplot(data = n_studies_per_fibertype_df, 
+                             aes(x = FiberType, y = V1, fill = FiberType)) +
+  geom_col() + 
+  scale_y_reverse(breaks = c(0, 3, 6, 9)) +
+  theme_publication() +
+  ylab("N° Studies per Fibertype") +
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "none")
+
+
+function_fibertype_plot <- ggplot(associations_fibertype_function_filt %>% 
+                                    group_by(Function) %>% complete(CAZyme),
+                                  aes(x = Function, y = CAZyme, fill = is.na(fc))) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("FALSE" = "black", "TRUE" = "white")) +
+  theme_publication() +
+  ggtitle("Functions") +
+  theme(legend.position = "none",
+        axis.text.y = element_blank(), axis.text.x = element_text(size = 5, angle = 270, hjust = 0, vjust = 1),
+        axis.title = element_blank(),
+        axis.ticks.y = element_blank())
+
+pdf("../Plots/CAZymes/Function Fiber Type.pdf")
+(associations_fibertype_plot + function_fibertype_plot + plot_layout(widths = c(7, 3))) / 
+  (n_studies_bar_plot + plot_spacer() + plot_layout(widths = c(7, 3))) + plot_layout(heights = c(6, 1))
+dev.off()
+
+pathway_fibertype_plot <- ggplot(associations_fibertype_function_filt %>%
+                                   group_by(CAZyme) %>% slice(1),
+                                 aes(x = 1, y = CAZyme, fill = Pathway))+
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("DF" = "black", "GAG" = "grey", "Unknown" = "white")) +
+  theme_publication() +
+  ggtitle("Pathway") +
+  theme(axis.text.y = element_blank(), axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        axis.title = element_blank())
+
+
+pdf("../figures/cazymes/Function + Pathway Fiber Type.pdf")
+(associations_fibertype_plot + pathway_fibertype_plot + function_fibertype_plot + plot_layout(widths = c(5, 0.5, 2))) /
+  (n_studies_bar_plot + plot_spacer() + plot_spacer() + plot_layout(widths = c(5, 0.5, 2))) + plot_layout(heights = c(6, 1))
+dev.off()
+```
+
+
+# Depleted Species
+
+```{r}
+relevant_negative_species <- readRDS("Relevant_Species.rds") %>% 
+  filter(fc < 0) %>% 
+  mutate(mOTU_ID = paste0("ref_mOTU_v3_", str_extract(Specie, "\\d{5}"))) 
+
+cazy_motu <- read.csv("../data/CAZy_mOTUs_abundances.tsv", sep = "\t")
+
+relevant_negative_cazymes_fibertype <- associations_fibertype_function_filt %>% 
+  filter(fc < 0 & p.adj <= 0.05) %>% 
+  pull(CAZyme) %>% 
+  unique()
+
+negative_cazymes_bacteria <- cazy_motu %>% 
+  filter(cazy_family %in% relevant_negative_cazymes_fibertype) %>% 
+  merge(relevant_negative_species, by = "mOTU_ID") %>% 
+  # group_by(Specie) %>% filter(any(prevalence > 0.1)) %>% ungroup() %>% 
+  arrange(fc) %>% 
+  mutate(cazy_family = factor(cazy_family, levels = levels(relevant_negative_cazymes_fibertype)),
+         Specie = factor(Specie, levels = unique(Specie)))
+
+negative_cazymes_bacteria_presence <- negative_cazymes_bacteria %>% 
+  group_by(cazy_family) %>% 
+  summarise(Presence = ifelse(any(prevalence > 0.3), 1, 0)) %>% 
+  ungroup() 
+table(negative_cazymes_bacteria_presence$Presence)[2] / (table(negative_cazymes_bacteria_presence$Presence)[1] + table(negative_cazymes_bacteria_presence$Presence)[2])
+
+ggplot(negative_cazymes_bacteria, aes(x = Specie, y = cazy_family, fill = prevalence)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "white", high = "black") +
+  labs(fill = "CAZyme\nPrevalence\nper Specie") +
+  theme_publication() +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_markdown(angle = 270, hjust = 0),
+        axis.text.y = element_text(size = 4),
+        axis.ticks = element_blank())
+
+ggsave("../figures/cazymes/Negative CAZyme Bacteria.pdf")
+```
+
